@@ -1,584 +1,362 @@
+typescript
+export interface Env {
+  EXPERIMENTS: KVNamespace;
+}
+
 interface Experiment {
   id: string;
   name: string;
+  description: string;
   variants: Variant[];
-  startTime: number;
-  trafficSplit: number;
-  targetPath: string;
-  status: 'draft' | 'running' | 'paused' | 'completed';
-  winner?: string;
+  trafficSplit: number; // Percentage to experiment (0-100)
+  createdAt: number;
+  status: 'active' | 'paused' | 'ended';
 }
 
 interface Variant {
   name: string;
-  weight: number;
-  visitors: number;
-  conversions: number;
-  customHtml?: string;
+  weight: number; // Percentage (0-100)
+  cssSelector: string;
+  htmlModification: string;
+  metrics: {
+    views: number;
+    conversions: number;
+  };
 }
 
-interface ExperimentRequest {
-  name: string;
-  variants: Omit<Variant, 'visitors' | 'conversions'>[];
-  trafficSplit: number;
-  targetPath: string;
-}
-
-interface ResultsResponse {
+interface ExperimentResult {
   experiment: Experiment;
-  significance?: number;
-  confidence?: number;
+  totals: {
+    views: number;
+    conversions: number;
+  };
+  variants: Array<Variant & {
+    conversionRate: number;
+    improvement: number;
+  }>;
 }
 
-const EXPERIMENTS_KEY = 'ab_experiments';
-const COOKIE_PREFIX = 'ab_';
+class ExperimentManager {
+  constructor(private kv: KVNamespace) {}
 
-const DEFAULT_STYLES = `
+  async createExperiment(experiment: Omit<Experiment, 'id' | 'createdAt' | 'status'>): Promise<Experiment> {
+    const id = `exp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const fullExperiment: Experiment = {
+      ...experiment,
+      id,
+      createdAt: Date.now(),
+      status: 'active'
+    };
+    
+    await this.kv.put(`experiment:${id}`, JSON.stringify(fullExperiment));
+    return fullExperiment;
+  }
+
+  async getExperiment(id: string): Promise<Experiment | null> {
+    const data = await this.kv.get(`experiment:${id}`);
+    return data ? JSON.parse(data) : null;
+  }
+
+  async getAllExperiments(): Promise<Experiment[]> {
+    const list = await this.kv.list({ prefix: 'experiment:' });
+    const experiments: Experiment[] = [];
+    
+    for (const key of list.keys) {
+      const data = await this.kv.get(key.name);
+      if (data) {
+        experiments.push(JSON.parse(data));
+      }
+    }
+    
+    return experiments;
+  }
+
+  async assignVariant(experimentId: string, request: Request): Promise<string | null> {
+    const experiment = await this.getExperiment(experimentId);
+    if (!experiment || experiment.status !== 'active') return null;
+
+    // Use consistent hashing based on IP + User-Agent
+    const ip = request.headers.get('cf-connecting-ip') || '';
+    const ua = request.headers.get('user-agent') || '';
+    const hash = this.hashString(`${ip}:${ua}:${experimentId}`);
+    
+    // Check if user falls into experiment traffic
+    if (hash % 100 >= experiment.trafficSplit) return null;
+
+    // Weighted random variant selection
+    const totalWeight = experiment.variants.reduce((sum, v) => sum + v.weight, 0);
+    let random = hash % totalWeight;
+    
+    for (const variant of experiment.variants) {
+      if (random < variant.weight) {
+        await this.recordView(experimentId, variant.name);
+        return variant.name;
+      }
+      random -= variant.weight;
+    }
+    
+    return null;
+  }
+
+  async recordView(experimentId: string, variantName: string): Promise<void> {
+    const experiment = await this.getExperiment(experimentId);
+    if (!experiment) return;
+
+    const variantIndex = experiment.variants.findIndex(v => v.name === variantName);
+    if (variantIndex === -1) return;
+
+    experiment.variants[variantIndex].metrics.views++;
+    await this.kv.put(`experiment:${experimentId}`, JSON.stringify(experiment));
+  }
+
+  async recordConversion(experimentId: string, variantName: string): Promise<void> {
+    const experiment = await this.getExperiment(experimentId);
+    if (!experiment) return;
+
+    const variantIndex = experiment.variants.findIndex(v => v.name === variantName);
+    if (variantIndex === -1) return;
+
+    experiment.variants[variantIndex].metrics.conversions++;
+    await this.kv.put(`experiment:${experimentId}`, JSON.stringify(experiment));
+  }
+
+  async getResults(experimentId: string): Promise<ExperimentResult | null> {
+    const experiment = await this.getExperiment(experimentId);
+    if (!experiment) return null;
+
+    const totals = {
+      views: experiment.variants.reduce((sum, v) => sum + v.metrics.views, 0),
+      conversions: experiment.variants.reduce((sum, v) => sum + v.metrics.conversions, 0)
+    };
+
+    const controlVariant = experiment.variants[0];
+    const controlRate = controlVariant.metrics.views > 0 
+      ? (controlVariant.metrics.conversions / controlVariant.metrics.views) * 100 
+      : 0;
+
+    const variants = experiment.variants.map(variant => {
+      const conversionRate = variant.metrics.views > 0 
+        ? (variant.metrics.conversions / variant.metrics.views) * 100 
+        : 0;
+      
+      const improvement = controlRate > 0 
+        ? ((conversionRate - controlRate) / controlRate) * 100 
+        : 0;
+
+      return {
+        ...variant,
+        conversionRate: parseFloat(conversionRate.toFixed(2)),
+        improvement: parseFloat(improvement.toFixed(2))
+      };
+    });
+
+    return {
+      experiment,
+      totals,
+      variants
+    };
+  }
+
+  private hashString(str: string): number {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      hash = ((hash << 5) - hash) + str.charCodeAt(i);
+      hash |= 0;
+    }
+    return Math.abs(hash);
+  }
+}
+
+const HTML_TEMPLATE = (content: string, experimentScript?: string) => `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fleet A/B Testing</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { 
       font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; 
-      background-color: #0a0a0f; 
-      color: #ffffff; 
-      line-height: 1.6;
+      background: #0a0a0f; 
+      color: #e2e8f0; 
+      line-height: 1.6; 
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
     }
-    .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+    .container { 
+      max-width: 1200px; 
+      margin: 0 auto; 
+      padding: 2rem; 
+      flex: 1;
+    }
     header { 
-      background: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%); 
-      padding: 2rem 0; 
-      border-bottom: 2px solid #f59e0b;
+      border-bottom: 1px solid #1e293b; 
+      padding-bottom: 1rem; 
+      margin-bottom: 2rem; 
     }
     h1 { 
       color: #f59e0b; 
       font-size: 2.5rem; 
-      margin-bottom: 0.5rem;
-      text-align: center;
+      margin-bottom: 0.5rem; 
     }
     .subtitle { 
-      color: #a1a1aa; 
-      text-align: center; 
-      font-size: 1.1rem;
+      color: #94a3b8; 
+      font-size: 1.1rem; 
     }
     .card { 
       background: #1a1a2e; 
-      border-radius: 10px; 
+      border-radius: 8px; 
       padding: 1.5rem; 
-      margin: 1rem 0; 
-      border: 1px solid #2d2d42;
+      margin-bottom: 1.5rem; 
+      border: 1px solid #2d3748; 
+    }
+    .card h2 { 
+      color: #f59e0b; 
+      margin-bottom: 1rem; 
+      font-size: 1.5rem; 
     }
     .btn { 
       background: #f59e0b; 
       color: #0a0a0f; 
       border: none; 
       padding: 0.75rem 1.5rem; 
-      border-radius: 6px; 
+      border-radius: 4px; 
       font-weight: 600; 
       cursor: pointer; 
-      transition: opacity 0.2s;
+      transition: opacity 0.2s; 
+      text-decoration: none; 
+      display: inline-block; 
     }
     .btn:hover { opacity: 0.9; }
     .btn-secondary { 
-      background: #2d2d42; 
-      color: #ffffff; 
+      background: #2d3748; 
+      color: #e2e8f0; 
     }
-    .stats-grid { 
+    .form-group { 
+      margin-bottom: 1rem; 
+    }
+    label { 
+      display: block; 
+      margin-bottom: 0.5rem; 
+      color: #cbd5e1; 
+      font-weight: 500; 
+    }
+    input, textarea, select { 
+      width: 100%; 
+      padding: 0.75rem; 
+      background: #0f172a; 
+      border: 1px solid #334155; 
+      border-radius: 4px; 
+      color: #e2e8f0; 
+      font-family: inherit; 
+    }
+    .variant-row { 
+      display: flex; 
+      gap: 1rem; 
+      margin-bottom: 1rem; 
+      align-items: flex-end; 
+    }
+    .variant-row input { 
+      flex: 1; 
+    }
+    .variant-row .weight { 
+      width: 100px; 
+    }
+    .metrics-grid { 
       display: grid; 
       grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); 
       gap: 1rem; 
-      margin: 1.5rem 0;
+      margin-top: 1rem; 
     }
-    .stat { 
-      background: #0a0a0f; 
+    .metric-card { 
+      background: #0f172a; 
       padding: 1rem; 
-      border-radius: 8px; 
-      border-left: 4px solid #f59e0b;
+      border-radius: 6px; 
+      border-left: 4px solid #f59e0b; 
     }
-    .stat-value { 
+    .metric-value { 
       font-size: 2rem; 
+      font-weight: 700; 
       color: #f59e0b; 
-      font-weight: 700;
     }
-    .stat-label { 
-      color: #a1a1aa; 
+    .metric-label { 
+      color: #94a3b8; 
       font-size: 0.9rem; 
-      text-transform: uppercase; 
-      letter-spacing: 1px;
+      margin-top: 0.25rem; 
     }
-    .variant-list { margin: 1.5rem 0; }
-    .variant-item { 
-      background: #0a0a0f; 
-      padding: 1rem; 
-      margin: 0.5rem 0; 
-      border-radius: 6px; 
-      border: 1px solid #2d2d42;
-    }
-    .winner-badge { 
-      background: #10b981; 
-      color: white; 
-      padding: 0.25rem 0.75rem; 
-      border-radius: 12px; 
-      font-size: 0.8rem; 
-      margin-left: 0.5rem;
-    }
-    .footer { 
-      margin-top: 3rem; 
-      padding: 2rem 0; 
+    .improvement-positive { color: #10b981; }
+    .improvement-negative { color: #ef4444; }
+    footer { 
+      background: #0f172a; 
+      padding: 2rem; 
       text-align: center; 
-      color: #6b7280; 
-      border-top: 1px solid #2d2d42;
+      border-top: 1px solid #1e293b; 
+      margin-top: auto; 
     }
-    .fleet-badge { 
-      display: inline-block; 
-      background: #f59e0b; 
-      color: #0a0a0f; 
-      padding: 0.5rem 1rem; 
-      border-radius: 20px; 
-      font-weight: 600; 
-      margin-top: 1rem;
+    .footer-content { 
+      max-width: 1200px; 
+      margin: 0 auto; 
+      color: #94a3b8; 
     }
-    .form-group { margin: 1rem 0; }
-    label { 
-      display: block; 
-      color: #a1a1aa; 
-      margin-bottom: 0.5rem; 
-      font-weight: 500;
-    }
-    input, select { 
-      width: 100%; 
-      padding: 0.75rem; 
-      background: #0a0a0f; 
-      border: 1px solid #2d2d42; 
-      border-radius: 6px; 
-      color: white; 
-      font-family: 'Inter', sans-serif;
-    }
-    .alert { 
-      padding: 1rem; 
-      border-radius: 6px; 
-      margin: 1rem 0;
-    }
-    .alert-success { background: #064e3b; border-left: 4px solid #10b981; }
-    .alert-error { background: #7f1d1d; border-left: 4px solid #ef4444; }
-    .nav { 
-      display: flex; 
-      gap: 1rem; 
-      margin: 2rem 0; 
-      justify-content: center;
-    }
-    .nav a { 
+    .footer-logo { 
       color: #f59e0b; 
-      text-decoration: none; 
-      padding: 0.5rem 1rem; 
+      font-weight: 700; 
+      font-size: 1.2rem; 
+      margin-bottom: 0.5rem; 
+    }
+    .health-status { 
+      display: inline-block; 
+      width: 10px; 
+      height: 10px; 
+      background: #10b981; 
+      border-radius: 50%; 
+      margin-right: 0.5rem; 
+    }
+    .experiment-list { 
+      display: grid; 
+      gap: 1rem; 
+    }
+    .experiment-item { 
+      display: flex; 
+      justify-content: space-between; 
+      align-items: center; 
+      padding: 1rem; 
+      background: #0f172a; 
       border-radius: 6px; 
-      transition: background 0.2s;
+      border-left: 4px solid #f59e0b; 
     }
-    .nav a:hover { background: #2d2d42; }
-    .active { background: #2d2d42; }
+    .status-badge { 
+      padding: 0.25rem 0.75rem; 
+      border-radius: 20px; 
+      font-size: 0.875rem; 
+      font-weight: 500; 
+    }
+    .status-active { background: #065f46; color: #6ee7b7; }
+    .status-paused { background: #92400e; color: #fbbf24; }
+    .status-ended { background: #1e293b; color: #94a3b8; }
   </style>
-`;
-
-class ExperimentStore {
-  async getExperiments(): Promise<Experiment[]> {
-    const data = await EXPERIMENTS.get(EXPERIMENTS_KEY);
-    return data ? JSON.parse(data) : [];
-  }
-
-  async saveExperiments(experiments: Experiment[]): Promise<void> {
-    await EXPERIMENTS.put(EXPERIMENTS_KEY, JSON.stringify(experiments));
-  }
-
-  async getExperiment(id: string): Promise<Experiment | null> {
-    const experiments = await this.getExperiments();
-    return experiments.find(exp => exp.id === id) || null;
-  }
-
-  async createExperiment(data: ExperimentRequest): Promise<Experiment> {
-    const experiments = await this.getExperiments();
-    const experiment: Experiment = {
-      id: crypto.randomUUID(),
-      name: data.name,
-      variants: data.variants.map(v => ({
-        ...v,
-        visitors: 0,
-        conversions: 0
-      })),
-      startTime: Date.now(),
-      trafficSplit: data.trafficSplit,
-      targetPath: data.targetPath,
-      status: 'draft'
-    };
-    
-    experiments.push(experiment);
-    await this.saveExperiments(experiments);
-    return experiment;
-  }
-
-  async updateExperiment(id: string, updates: Partial<Experiment>): Promise<Experiment | null> {
-    const experiments = await this.getExperiments();
-    const index = experiments.findIndex(exp => exp.id === id);
-    if (index === -1) return null;
-    
-    experiments[index] = { ...experiments[index], ...updates };
-    await this.saveExperiments(experiments);
-    return experiments[index];
-  }
-
-  async recordVisit(experimentId: string, variantName: string): Promise<void> {
-    const experiments = await this.getExperiments();
-    const experiment = experiments.find(exp => exp.id === experimentId);
-    if (!experiment || experiment.status !== 'running') return;
-    
-    const variant = experiment.variants.find(v => v.name === variantName);
-    if (variant) {
-      variant.visitors++;
-      await this.saveExperiments(experiments);
-    }
-  }
-
-  async recordConversion(experimentId: string, variantName: string): Promise<void> {
-    const experiments = await this.getExperiments();
-    const experiment = experiments.find(exp => exp.id === experimentId);
-    if (!experiment || experiment.status !== 'running') return;
-    
-    const variant = experiment.variants.find(v => v.name === variantName);
-    if (variant) {
-      variant.conversions++;
-      await this.saveExperiments(experiments);
-    }
-  }
-}
-
-class ABTestHandler {
-  private store: ExperimentStore;
-
-  constructor() {
-    this.store = new ExperimentStore();
-  }
-
-  async handleRequest(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    if (path === '/health') {
-      return new Response(JSON.stringify({ status: 'healthy', timestamp: new Date().toISOString() }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    if (path === '/' || path === '/dashboard') {
-      return this.renderDashboard();
-    }
-
-    if (path.startsWith('/api/')) {
-      return this.handleAPI(request, path);
-    }
-
-    const experiments = await this.store.getExperiments();
-    const activeExperiment = experiments.find(exp => 
-      exp.status === 'running' && 
-      exp.targetPath && 
-      path.startsWith(exp.targetPath)
-    );
-
-    if (activeExperiment && Math.random() * 100 < activeExperiment.trafficSplit) {
-      const variant = this.selectVariant(activeExperiment.variants);
-      const cookieName = `${COOKIE_PREFIX}${activeExperiment.id}`;
-      
-      await this.store.recordVisit(activeExperiment.id, variant.name);
-      
-      const originalResponse = await fetch(request);
-      const response = new Response(originalResponse.body, originalResponse);
-      
-      response.headers.set('Set-Cookie', `${cookieName}=${variant.name}; Path=/; Max-Age=86400`);
-      
-      if (variant.customHtml && originalResponse.headers.get('Content-Type')?.includes('text/html')) {
-        const text = await originalResponse.text();
-        const modified = text.replace('</head>', `${variant.customHtml}</head>`);
-        return new Response(modified, response);
-      }
-      
-      return response;
-    }
-
-    return fetch(request);
-  }
-
-  private selectVariant(variants: Variant[]): Variant {
-    const totalWeight = variants.reduce((sum, v) => sum + v.weight, 0);
-    let random = Math.random() * totalWeight;
-    
-    for (const variant of variants) {
-      if (random < variant.weight) {
-        return variant;
-      }
-      random -= variant.weight;
-    }
-    
-    return variants[0];
-  }
-
-  private async handleAPI(request: Request, path: string): Promise<Response> {
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    };
-
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders });
-    }
-
-    try {
-      switch (path) {
-        case '/api/experiment':
-          if (request.method === 'POST') {
-            const data: ExperimentRequest = await request.json();
-            const experiment = await this.store.createExperiment(data);
-            return new Response(JSON.stringify(experiment), {
-              headers: { 'Content-Type': 'application/json', ...corsHeaders }
-            });
-          }
-          break;
-
-        case '/api/results':
-          if (request.method === 'GET') {
-            const url = new URL(request.url);
-            const id = url.searchParams.get('id');
-            if (!id) {
-              const experiments = await this.store.getExperiments();
-              return new Response(JSON.stringify(experiments), {
-                headers: { 'Content-Type': 'application/json', ...corsHeaders }
-              });
-            }
-            
-            const experiment = await this.store.getExperiment(id);
-            if (!experiment) {
-              return new Response(JSON.stringify({ error: 'Experiment not found' }), {
-                status: 404,
-                headers: { 'Content-Type': 'application/json', ...corsHeaders }
-              });
-            }
-            
-            const results: ResultsResponse = {
-              experiment,
-              significance: this.calculateSignificance(experiment),
-              confidence: this.calculateConfidence(experiment)
-            };
-            
-            return new Response(JSON.stringify(results), {
-              headers: { 'Content-Type': 'application/json', ...corsHeaders }
-            });
-          }
-          break;
-
-        case '/api/rollout':
-          if (request.method === 'POST') {
-            const { id, variant, action } = await request.json();
-            
-            if (action === 'start') {
-              const updated = await this.store.updateExperiment(id, { status: 'running' });
-              return new Response(JSON.stringify(updated), {
-                headers: { 'Content-Type': 'application/json', ...corsHeaders }
-              });
-            }
-            
-            if (action === 'declare-winner') {
-              const updated = await this.store.updateExperiment(id, { 
-                winner: variant,
-                status: 'completed'
-              });
-              return new Response(JSON.stringify(updated), {
-                headers: { 'Content-Type': 'application/json', ...corsHeaders }
-              });
-            }
-            
-            if (action === 'pause') {
-              const updated = await this.store.updateExperiment(id, { status: 'paused' });
-              return new Response(JSON.stringify(updated), {
-                headers: { 'Content-Type': 'application/json', ...corsHeaders }
-              });
-            }
-          }
-          break;
-
-        case '/api/conversion':
-          if (request.method === 'POST') {
-            const cookies = request.headers.get('Cookie') || '';
-            const experiments = await this.store.getExperiments();
-            
-            for (const experiment of experiments) {
-              if (experiment.status !== 'running') continue;
-              
-              const cookieName = `${COOKIE_PREFIX}${experiment.id}`;
-              const match = cookies.match(new RegExp(`${cookieName}=([^;]+)`));
-              
-              if (match) {
-                await this.store.recordConversion(experiment.id, match[1]);
-              }
-            }
-            
-            return new Response(JSON.stringify({ success: true }), {
-              headers: { 'Content-Type': 'application/json', ...corsHeaders }
-            });
-          }
-          break;
-      }
-    } catch (error) {
-      return new Response(JSON.stringify({ error: 'Internal server error' }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-
-    return new Response(JSON.stringify({ error: 'Not found' }), {
-      status: 404,
-      headers: { 'Content-Type': 'application/json', ...corsHeaders }
-    });
-  }
-
-  private calculateSignificance(experiment: Experiment): number {
-    const variants = experiment.variants;
-    if (variants.length < 2) return 0;
-    
-    const control = variants[0];
-    const test = variants[1];
-    
-    if (control.visitors === 0 || test.visitors === 0) return 0;
-    
-    const controlRate = control.conversions / control.visitors;
-    const testRate = test.conversions / test.visitors;
-    const pooledRate = (control.conversions + test.conversions) / (control.visitors + test.visitors);
-    const se = Math.sqrt(pooledRate * (1 - pooledRate) * (1/control.visitors + 1/test.visitors));
-    
-    if (se === 0) return 0;
-    
-    const z = (testRate - controlRate) / se;
-    return Math.min(1, Math.max(0, 1 - this.normCDF(Math.abs(z))));
-  }
-
-  private calculateConfidence(experiment: Experiment): number {
-    const significance = this.calculateSignificance(experiment);
-    return Math.round((1 - significance) * 100);
-  }
-
-  private normCDF(x: number): number {
-    const t = 1 / (1 + 0.2316419 * Math.abs(x));
-    const d = 0.3989423 * Math.exp(-x * x / 2);
-    let prob = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
-    
-    if (x > 0) prob = 1 - prob;
-    return prob;
-  }
-
-  private async renderDashboard(): Promise<Response> {
-    const experiments = await this.store.getExperiments();
-    
-    const html = `
-      <!DOCTYPE html>
-      <html lang="en">
-      <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Fleet A/B Testing</title>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-        ${DEFAULT_STYLES}
-      </head>
-      <body>
-        <header>
-          <div class="container">
-            <h1>🚀 Fleet A/B Testing</h1>
-            <p class="subtitle">Enterprise-grade experimentation platform</p>
-            <div class="nav">
-              <a href="/dashboard" class="active">Dashboard</a>
-              <a href="#create">New Experiment</a>
-              <a href="#results">Results</a>
-            </div>
-          </div>
-        </header>
-        
-        <main class="container">
-          <div class="stats-grid">
-            <div class="stat">
-              <div class="stat-value">${experiments.length}</div>
-              <div class="stat-label">Total Experiments</div>
-            </div>
-            <div class="stat">
-              <div class="stat-value">${experiments.filter(e => e.status === 'running').length}</div>
-              <div class="stat-label">Active Tests</div>
-            </div>
-            <div class="stat">
-              <div class="stat-value">${experiments.filter(e => e.status === 'completed' && e.winner).length}</div>
-              <div class="stat-label">Winners Declared</div>
-            </div>
-            <div class="stat">
-              <div class="stat-value">${experiments.reduce((sum, e) => sum + e.variants.reduce((s, v) => s + v.visitors, 0), 0)}</div>
-              <div class="stat-label">Total Visitors</div>
-            </div>
-          </div>
-          
-          <div class="card">
-            <h2>Create New Experiment</h2>
-            <form id="experimentForm">
-              <div class="form-group">
-                <label for="name">Experiment Name</label>
-                <input type="text" id="name" name="name" required placeholder="Homepage Hero Test">
-              </div>
-              <div class="form-group">
-                <label for="targetPath">Target Path</label>
-                <input type="text" id="targetPath" name="targetPath" required placeholder="/" value="/">
-              </div>
-              <div class="form-group">
-                <label for="trafficSplit">Traffic Split (%)</label>
-                <input type="number" id="trafficSplit" name="trafficSplit" min="1" max="100" value="50">
-              </div>
-              <div class="form-group">
-                <label>Variants</label>
-                <div id="variantsContainer">
-                  <div class="variant-item">
-                    <input type="text" name="variantName[]" placeholder="Control" value="Control" required>
-                    <input type="number" name="variantWeight[]" placeholder="Weight" value="50" min="1" max="100" required>
-                  </div>
-                  <div class="variant-item">
-                    <input type="text" name="variantName[]" placeholder="Variant A" value="Variant A" required>
-                    <input type="number" name="variantWeight[]" placeholder="Weight" value="50" min="1" max="100" required>
-                  </div>
-                </div>
-                <button type="button" class="btn btn-secondary" onclick="addVariant()">Add Variant</button>
-              </div>
-              <button type="submit" class="btn">Create Experiment</button>
-            </form>
-          </div>
-          
-          <div class="card">
-            <h2>Active Experiments</h2>
-            <div class="variant-list">
-              ${experiments.filter(e => e.status === 'running').map(exp => `
-                <div class="variant-item">
-                  <h3>${exp.name}</h3>
-                  <p>Path: ${exp.targetPath} | Traffic: ${exp.trafficSplit}%</p>
-                  <div class="stats-grid">
-                    ${exp.variants.map(v => `
-                      <div class="stat">
-                        <div class="stat-value">${((v.conversions / (v.visitors || 1)) * 100).toFixed(1)}%</div>
-                        <div class="stat-label">${v.name} (${v.visitors} visitors)</div>
-                      </div>
-                    `).join('')}
-                  </div>
-                  <button class="btn btn-secondary" onclick="declareWinner('${exp.id}', '${exp.variants[1]?.name}')">
-                    Declare ${exp.variants[1]?.name} as Winner
-                  </button>
-                  <button class="btn btn-secondary" onclick="pauseExperiment('${exp.id}')">Pause</button>
-                </div>
-              `).join('') || '<p>No active experiments</p>'}
-            </div>
-          </div>
-          
-          <div class="card">
-            <h2>Experiment Results</h2>
-            <div class="variant-list">
-              ${experiments.map(exp => `
-                <div class="variant-item">
-                  <h3>${exp.name} 
-                    ${exp.winner ? `<span class="winner-badge">Winner:
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Fleet A/B Testing</h1>
+      <div class="subtitle">Cloudflare Worker-based experimentation platform</div>
+    </header>
+    ${content}
+  </div>
+  <footer>
+    <div class="footer-content">
+      <div class="footer-logo">Fleet A/B Testing Platform</div>
+      <div>Built with Cloudflare Workers • Zero Dependencies • Global Edge Network</div>
+      <div style="margin-top: 1rem; font-size: 0.875rem;">
+        <span class="health-status"></span> System Operational
+      </div>
+    </div>
+  </footer>
+  ${experimentScript || ''}
+</body>
+</html>`;
 const sh={"Content-Security-Policy":"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; frame-ancestors 'none'","X-Frame-Options":"DENY"};
 export default{async fetch(r:Request){const u=new URL(r.url);if(u.pathname==='/health')return new Response(JSON.stringify({status:'ok'}),{headers:{'Content-Type':'application/json',...sh}});return new Response(html,{headers:{'Content-Type':'text/html;charset=UTF-8',...sh}});}};
